@@ -13,12 +13,27 @@ YTOmarchy1 reports:
 
 > connection type is not allowed on this machine
 
-That message is shown on the **controller**. On the **host** (OmarchyT430s) the
-same attempt is visible in logs as a successful router handshake followed by
-`TeamViewer_Desktop` dying and `AuthenticationTimeout`.
+Treat that as **two possible causes**. Check YTOmarchy1 logs first:
 
-Do not treat this as "the daemon is down" or "the ID is blank". Both sides reach
-TeamViewer routers. The session type (Wayland remote control) is what fails.
+```bash
+rg -n "CommercialBlocker|CommercialBlockerOffender|connection type|not allowed|BLOCKED|AuthenticationTimeout" \
+  ~/.local/share/teamviewer15/logfiles/TeamViewer15_Logfile.log \
+  /var/log/teamviewer15/TeamViewer15_Logfile.log
+```
+
+1. **License/policy (controller-side).** TeamViewer Free may log `BLOCKED` with
+   `CommercialBlockerOffender=ActiveSide`. That is an account flag, not a
+   firewall. Another client (OmarchyT430s) can still reach the same partner
+   while YTOmarchy1 cannot. Cooldown / another account / personal license.
+   This script cannot clear it.
+
+2. **Host cannot offer Wayland remote control.** On OmarchyT430s the same
+   attempt is a successful router handshake, then `TeamViewer_Desktop` dies
+   and `AuthenticationTimeout`. Details below.
+
+Do not treat this as "the daemon is down" or "the ID is blank". `teamviewer info`
+as a normal user prints an empty ID because `/etc/teamviewer/global.conf` is
+root-only; trust the GUI.
 
 ## IDs (from host logs)
 
@@ -143,7 +158,7 @@ systemctl is-active teamviewerd
 systemctl --user is-active xdg-desktop-portal xdg-desktop-portal-hyprland
 
 # GUI, not `teamviewer info` (empty ID as non-root is normal)
-rg -n "connection type|not allowed|Wayland|RemoteDesktop|incoming|AuthenticationTimeout|LAN only|whitelist" \
+rg -n "CommercialBlocker|connection type|not allowed|Wayland|RemoteDesktop|incoming|AuthenticationTimeout|LAN only|whitelist" \
   ~/.local/share/teamviewer15/logfiles/TeamViewer15_Logfile.log \
   ~/.local/share/teamviewer15/logfiles/gui.log \
   /var/log/teamviewer15/TeamViewer15_Logfile.log
@@ -158,22 +173,22 @@ Check in the YTOmarchy1 GUI:
 - Extras → Options → Advanced / incoming LAN connections: **not** "LAN only" (host briefly logged `LAN only is active` during testing)
 - Computers & Contacts: host ID `1214731265` is not blocked; host had `usewhitelist = 1`
 - Connecting to **remote control**, not file transfer / meeting only
-- Commercial-use / license dialogs (free Linux clients sometimes refuse a session type)
+- Commercial-use / license dialogs. Prefer the `CommercialBlockerOffender` grep above over guessing.
 
 If YTOmarchy1 is also Omarchy/Hyprland, it has the same portal gap when **it** is the host. The current failure is YTOmarchy1 as **controller** of OmarchyT430s as **host**.
 
 ## What the deploy script does vs does not
 
-Does: daemon, `QT_QPA_PLATFORM=xcb`, ffmpeg 4.4, opaque Hyprland window rules.
+Does: daemon, `QT_QPA_PLATFORM=xcb`, ffmpeg 4.4, opaque Hyprland window rules, and a `TeamViewer_Desktop` wrapper that injects the Hyprland session env (pacman hook re-applies it).
 
-Does not: spawn `TeamViewer_Desktop` in the UWSM session, install a RemoteDesktop portal, set a personal password, or disable whitelist/LAN-only.
+Does not: install a RemoteDesktop portal, set a personal password, clear a commercial-use block, or disable whitelist/LAN-only.
 
-Outgoing from OmarchyT430s (this PC controlling another) can work. Incoming control of this Hyprland desktop cannot until A+B are fixed.
+Outgoing from OmarchyT430s (this PC controlling another) can work. Incoming control of this Hyprland desktop cannot until B is fixed (and A is already partially addressed by the wrapper).
 
 ## Next experiments (do not do blindly)
 
 1. On the **host**, install a RemoteDesktop-capable portal as a fallback, e.g. `xdg-desktop-portal-luminous`, and point only `org.freedesktop.impl.portal.RemoteDesktop` at it. Keep hyprland for ScreenCast. Restart user portals (`systemctl --user restart xdg-desktop-portal xdg-desktop-portal-hyprland`).
-2. Wrap `/opt/teamviewer/tv_bin/TeamViewer_Desktop` so teamviewerd’s spawn is `systemd-run --user` inside `user@UID.service` with the compositor environment. Re-apply after `teamviewer` package updates. Useless without (1).
-3. Confirm YTOmarchy1’s "connection type is not allowed" string in its GUI log; it may be a license/policy message rather than the host portal failure. If YTOmarchy1 can remote-control a non-Wayland box, the block is host-side.
+2. The deploy script already wraps `TeamViewer_Desktop` with session env. If YTOmarchy1 still fails after a host re-deploy, look at (1) and at `CommercialBlockerOffender`.
+3. If YTOmarchy1 can remote-control a Windows/macOS box but not OmarchyT430s, the block is host-side (portal). If it cannot remote-control anyone, grep for `CommercialBlockerOffender=ActiveSide`.
 
 Do not switch Omarchy to Xorg as a "fix" without the user asking. Do not edit `/usr/share/omarchy/`.
