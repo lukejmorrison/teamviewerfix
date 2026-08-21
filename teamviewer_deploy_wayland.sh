@@ -296,4 +296,4 @@ else
 fi
 
 log "First-run: accept the EULA in the GUI. For unattended access, set a personal password under Extras → Options → Security."
-log "Incoming Wayland control uses the desktop portal — approve the share prompt if the remote sees a black screen.\n
+log "Incoming Wayland control uses the desktop portal — approve the share prompt if the remote sees a black screen."
