@@ -241,8 +241,10 @@ ok "wrote ${BIN_DIR}/teamviewer"
 HYPR_LUA="${TARGET_HOME}/.config/hypr/hyprland.lua"
 if [[ -f "${HYPR_LUA}" ]]; then
   log "Patching Hyprland window rules in ${HYPR_LUA}"
-  if grep -qF "${HYPR_MARKER_BEGIN}" "${HYPR_LUA}" \
-     || grep -q 'o.window("TeamViewer"' "${HYPR_LUA}"; then
+  # Lua comments start with "--"; GNU grep treats that as an option unless
+  # the pattern is passed with -e and option parsing is stopped with --.
+  if grep -qF -e "${HYPR_MARKER_BEGIN}" -- "${HYPR_LUA}" \
+     || grep -qF -e 'o.window("TeamViewer"' -- "${HYPR_LUA}"; then
     ok "TeamViewer window rules already present"
   else
     as_user tee -a "${HYPR_LUA}" >/dev/null <<EOF
