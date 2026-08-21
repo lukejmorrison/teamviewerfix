@@ -69,13 +69,13 @@ Use `teamviewer daemon enable` at least once so TeamViewer owns the systemd syml
 qt.qpa.plugin: Could not find the Qt platform plugin "wayland" in ""
 ```
 
-TeamViewer 15 ships Qt **5.15** and still speaks X11. On Hyprland it must run through **XWayland**. The GUI can fall back to `xcb` on its own, but launcher/environment races are common. Pin it:
+TeamViewer 15 ships Qt **5.15** and still speaks X11. On Hyprland it must run through **XWayland**. The GUI can fall back to `xcb` on its own, but Omarchy sets `QT_QPA_PLATFORM=wayland;xcb` for the session, so Qt tries Wayland first and logs `Could not find the Qt platform plugin "wayland"`. Pin TeamViewer only:
 
 ```bash
 env QT_QPA_PLATFORM=xcb teamviewer
 ```
 
-Do **not** export `QT_QPA_PLATFORM=xcb` for the whole session — that breaks native Wayland Qt apps. Only the TeamViewer desktop file and a `~/.local/bin/teamviewer` wrapper set it.
+Do **not** export `QT_QPA_PLATFORM=xcb` for the whole session — that breaks native Wayland Qt apps. Only the TeamViewer desktop file and a `~/.local/bin/teamviewer` wrapper set it, and they **force** `xcb` rather than defaulting only when the variable is unset.
 
 ### 3. Session video needs ffmpeg 4.x SONAMEs
 
@@ -111,16 +111,40 @@ The deploy script wraps this in `-- teamviewerfix:begin` / `-- teamviewerfix:end
 
 `teamviewer license` launches `teamviewer-config`, which SIGSEGV'd on this setup (`teamviewer-config_FI_*.stack` in the user log dir). Accept the EULA in the GUI instead. Do not automate `teamviewer license accept`.
 
+### 6. Incoming screen share dies on uwsm/Hyprland
+
+Controlling this Omarchy box from another TeamViewer client reaches the daemon, then fails with:
+
+> On your partner's side screen sharing is currently not possible, therefore the connection was canceled.
+
+Daemon log:
+
+```
+LaunchDesktopProcess: session bus not found
+CreateProcess '/opt/teamviewer/tv_bin/TeamViewer_Desktop' as user luke (1000)
+SysSessionInfoManager::GetOwnProcessSession: No session found!
+!!!Own session could not be resolved, unable to startup
+```
+
+Omarchy runs Hyprland under **uwsm**. The logind session leader is `sddm-helper` (no user D-Bus). `teamviewerd` is a system unit, so it cannot see `/run/user/1000/bus` and falls back to `su`, which starts `TeamViewer_Desktop` with no `WAYLAND_DISPLAY`. Outgoing control of Windows/macOS does not need this helper.
+
+Fix: replace `/opt/teamviewer/tv_bin/TeamViewer_Desktop` with a wrapper that imports `XDG_RUNTIME_DIR`, the user D-Bus, `WAYLAND_DISPLAY`, and `DISPLAY=:0`, then `exec`s the real ELF (`TeamViewer_Desktop.real`). A pacman hook restores the wrapper after `teamviewer` upgrades.
+
+Run the deploy script **on the machine you want to control** (both Omarchy PCs if you remote both ways). Keep a logged-in graphical session. Set an unattended password. Approve the portal share prompt if the client sees a black frame.
+
 ## What the script does
 
 1. Install `ffmpeg4.4` (Arch extra) if missing.
 2. Install `teamviewer` from the AUR if missing (`omarchy pkg aur add`, else `yay` / `paru`).
 3. `teamviewer daemon enable` + `systemctl enable --now teamviewerd`.
-4. Write `~/.local/share/applications/com.teamviewer.TeamViewer.desktop` with `QT_QPA_PLATFORM=xcb`.
-5. Write `~/.local/bin/teamviewer` (same `xcb` pin) so a terminal launch matches the app launcher.
-6. Append the Hyprland opacity rules to `~/.config/hypr/hyprland.lua` if that file exists.
-7. `hyprctl reload` when Hyprland is running.
-8. Print daemon / package status.
+4. Write `~/.local/bin/teamviewer` with an unconditional `QT_QPA_PLATFORM=xcb` pin.
+5. Write `~/.local/share/applications/com.teamviewer.TeamViewer.desktop` so the app launcher runs that wrapper (`DBusActivatable=false`).
+6. Override `~/.local/share/dbus-1/services/com.teamviewer.TeamViewer.service` so uwsm/gtk-launch D-Bus activation also hits the wrapper (stock Exec is `/opt/teamviewer/tv_bin/TeamViewer` and ignores the desktop file).
+7. Wrap `/opt/teamviewer/tv_bin/TeamViewer_Desktop` so incoming capture runs with the Hyprland session environment (`WAYLAND_DISPLAY`, user D-Bus). A pacman hook re-applies this after a TeamViewer upgrade.
+8. Override `com.teamviewer.TeamViewer.Desktop` D-Bus activation the same way.
+9. Append the Hyprland opacity rules to `~/.config/hypr/hyprland.lua` if that file exists.
+10. `hyprctl reload` when Hyprland is running.
+11. Print daemon / package status.
 
 If you run the script with `sudo`, it still writes desktop/Hyprland files as the **desktop user** (`$SUDO_USER`), not root.
 
@@ -128,10 +152,10 @@ If you run the script with `sudo`, it still writes desktop/Hyprland files as the
 
 1. Open **TeamViewer** and accept the license agreement.
 2. Confirm **Your ID** is populated (not blank). `teamviewer info` as a normal user may still print an empty ID because `/etc/teamviewer/global.conf` is root-only; trust the GUI.
-3. For unattended access: **Extras → Options → Security** → set a personal password. The daemon already starts at boot; the GUI does not need to stay open.
+3. For unattended access: **Extras → Options → Security** → set a personal password. The daemon starts at boot. Incoming capture still needs a logged-in Hyprland session (the wrapper talks to that session; it cannot create one).
 4. Incoming control of a Wayland session uses `xdg-desktop-portal-hyprland`. If the remote side sees a **black screen**, approve the share/portal prompt on the Omarchy box.
 
-Outgoing connections (this PC controlling another) work through XWayland and do not depend on the portal.
+Outgoing connections (this PC controlling Windows or macOS) work through XWayland and do not depend on the portal. Omarchy-to-Omarchy incoming needs the Desktop wrapper on the **host**.
 
 ## Verify
 
@@ -174,6 +198,7 @@ Edit **user** config only (`~/.config/hypr/`, `~/.local/`). Never edit `/usr/sha
 - TeamViewer 15 on Linux is still an X11/Qt5 client. This is a working Wayland *host* setup, not native Wayland.
 - Incoming desktop capture quality depends on the portal stack (`xdg-desktop-portal`, `xdg-desktop-portal-hyprland`, PipeWire). Those are stock on Omarchy.
 - This does not log you into a TeamViewer account or set an unattended password.
+- TeamViewer **Free** may return `Connection type not allowed` or `BLOCKED` with `CommercialBlockerOffender=ActiveSide` on a machine TeamViewer has flagged for commercial use. That is an account/license decision, not a Linux firewall. A different client (for example the T430s) can still reach the same Mac while the flagged PC cannot. Waiting out the cooldown, using another TeamViewer account, or a personal license is the fix — not this script.
 
 ## License
 

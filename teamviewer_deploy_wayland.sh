@@ -7,6 +7,8 @@
 #   2. Qt5 has no Wayland plugin       ->  force QT_QPA_PLATFORM=xcb (XWayland)
 #   3. Missing ffmpeg 4.x SONAMEs      ->  install extra/ffmpeg4.4 for session video
 #   4. Hyprland default window opacity ->  keep TeamViewer fully opaque
+#   5. Incoming capture helper dies    ->  wrap TeamViewer_Desktop with Hyprland session env
+#      (daemon logs "session bus not found" then "Own session could not be resolved")
 #
 # Usage:
 #   ./teamviewer_deploy_wayland.sh
@@ -26,6 +28,12 @@ HYPR_MARKER_BEGIN="-- teamviewerfix:begin"
 HYPR_MARKER_END="-- teamviewerfix:end"
 DESKTOP_ID="com.teamviewer.TeamViewer.desktop"
 TEAMVIEWER_BIN="/opt/teamviewer/tv_bin/script/teamviewer"
+TV_DESKTOP_ELF="/opt/teamviewer/tv_bin/TeamViewer_Desktop"
+TV_DESKTOP_REAL="/opt/teamviewer/tv_bin/TeamViewer_Desktop.real"
+TVFIX_LIB="/usr/local/lib/teamviewerfix"
+TVFIX_WRAP="${TVFIX_LIB}/TeamViewer_Desktop"
+TVFIX_REWRAP="${TVFIX_LIB}/rewrap.sh"
+TVFIX_HOOK="/etc/pacman.d/hooks/teamviewerfix-desktop.hook"
 
 usage() {
   cat <<'EOF'
@@ -92,6 +100,122 @@ need_root() {
     sudo "$@"
   else
     die "Need root for: $*"
+  fi
+}
+
+# teamviewerd (system) cannot see the uwsm user session bus, so it falls back
+# to CreateProcess/su. That helper has no WAYLAND_DISPLAY and exits with
+# "Own session could not be resolved". Inject the graphical env, then exec
+# the real ELF. Absolute path is hard-coded by the daemon, so wrap /opt.
+install_desktop_session_wrapper() {
+  log "Installing TeamViewer_Desktop session wrapper (incoming capture)"
+
+  need_root mkdir -p "${TVFIX_LIB}" /etc/pacman.d/hooks
+
+  need_root tee "${TVFIX_WRAP}" >/dev/null <<'EOF'
+#!/usr/bin/env bash
+# teamviewerfix: run TeamViewer_Desktop in the Omarchy/Hyprland graphical session.
+# teamviewerd starts this via absolute path as the desktop user with no
+# WAYLAND_DISPLAY / session bus. Import them, then exec the real ELF.
+set -euo pipefail
+
+REAL="/opt/teamviewer/tv_bin/TeamViewer_Desktop.real"
+if [[ ! -x "${REAL}" ]]; then
+  printf 'teamviewerfix: missing %s (re-run teamviewer_deploy_wayland.sh)\n' "${REAL}" >&2
+  exit 1
+fi
+
+uid="$(id -u)"
+runtime="${XDG_RUNTIME_DIR:-/run/user/${uid}}"
+export XDG_RUNTIME_DIR="${runtime}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${runtime}/bus}"
+export QT_QPA_PLATFORM=xcb
+
+if [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
+  shopt -s nullglob
+  for sock in "${runtime}"/wayland-*; do
+    [[ -S "${sock}" && "${sock}" != *.lock ]] || continue
+    export WAYLAND_DISPLAY="${sock##*/}"
+    break
+  done
+  shopt -u nullglob
+fi
+
+if [[ -z "${DISPLAY:-}" ]]; then
+  if [[ -S /tmp/.X11-unix/X0 ]]; then
+    export DISPLAY=:0
+  elif [[ -S "${runtime}/.X11-unix/X0" ]]; then
+    export DISPLAY=:0
+  fi
+fi
+
+export XDG_SESSION_TYPE="${XDG_SESSION_TYPE:-wayland}"
+export XDG_SESSION_CLASS="${XDG_SESSION_CLASS:-user}"
+export XDG_CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-Hyprland}"
+
+if [[ -z "${HYPRLAND_INSTANCE_SIGNATURE:-}" && -d "${runtime}/hypr" ]]; then
+  shopt -s nullglob
+  for dir in "${runtime}"/hypr/*; do
+    [[ -d "${dir}" ]] || continue
+    export HYPRLAND_INSTANCE_SIGNATURE="${dir##*/}"
+    break
+  done
+  shopt -u nullglob
+fi
+
+exec "${REAL}" "$@"
+EOF
+  need_root chmod 755 "${TVFIX_WRAP}"
+  ok "wrote ${TVFIX_WRAP}"
+
+  need_root tee "${TVFIX_REWRAP}" >/dev/null <<'EOF'
+#!/usr/bin/env bash
+# Re-wrap /opt/teamviewer/tv_bin/TeamViewer_Desktop after a teamviewer package update.
+set -euo pipefail
+TV_BIN="/opt/teamviewer/tv_bin/TeamViewer_Desktop"
+TV_REAL="/opt/teamviewer/tv_bin/TeamViewer_Desktop.real"
+WRAP="/usr/local/lib/teamviewerfix/TeamViewer_Desktop"
+[[ -x "${WRAP}" ]] || exit 0
+[[ -e "${TV_BIN}" || -e "${TV_REAL}" ]] || exit 0
+
+is_elf() {
+  local path="$1"
+  [[ -f "${path}" && ! -L "${path}" ]] || return 1
+  local mag
+  mag="$(head -c 4 "${path}" 2>/dev/null || true)"
+  [[ "${mag}" == $'\x7fELF' ]]
+}
+
+if is_elf "${TV_BIN}"; then
+  mv -f "${TV_BIN}" "${TV_REAL}"
+fi
+if [[ ! -x "${TV_REAL}" ]]; then
+  echo "teamviewerfix rewrap: no ELF at ${TV_REAL}" >&2
+  exit 1
+fi
+ln -sfn "${WRAP}" "${TV_BIN}"
+EOF
+  need_root chmod 755 "${TVFIX_REWRAP}"
+
+  need_root tee "${TVFIX_HOOK}" >/dev/null <<EOF
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = teamviewer
+
+[Action]
+Description = Re-apply teamviewerfix TeamViewer_Desktop session wrapper
+When = PostTransaction
+Exec = ${TVFIX_REWRAP}
+EOF
+  ok "wrote ${TVFIX_HOOK}"
+
+  need_root "${TVFIX_REWRAP}"
+  if [[ -L "${TV_DESKTOP_ELF}" ]]; then
+    ok "wrapped ${TV_DESKTOP_ELF} -> ${TVFIX_WRAP}"
+  else
+    warn "wrapper install may have failed; ${TV_DESKTOP_ELF} is not a symlink"
   fi
 }
 
@@ -199,13 +323,32 @@ else
   die "teamviewerd failed to start"
 fi
 
+install_desktop_session_wrapper
+
 # ---------------------------------------------------------------------------
+# Terminal launches: ~/.local/bin is on PATH ahead of /usr/bin on Omarchy.
+# Write the wrapper first so the desktop file can Exec it. uwsm/systemd
+# drop a leading `env VAR=value` from .desktop Exec lines.
+log "Installing ~/.local/bin/teamviewer wrapper (forces xcb)"
+BIN_DIR="${TARGET_HOME}/.local/bin"
+as_user mkdir -p "${BIN_DIR}"
+as_user tee "${BIN_DIR}/teamviewer" >/dev/null <<'EOF'
+#!/usr/bin/env bash
+# Force Qt5 TeamViewer onto XWayland. The bundled Qt has no wayland plugin.
+# Always override: Omarchy sets QT_QPA_PLATFORM=wayland;xcb for the session,
+# so ${QT_QPA_PLATFORM:-xcb} would keep Wayland and hit the missing plugin.
+export QT_QPA_PLATFORM=xcb
+exec /opt/teamviewer/tv_bin/script/teamviewer "$@"
+EOF
+as_user chmod 755 "${BIN_DIR}/teamviewer"
+ok "wrote ${BIN_DIR}/teamviewer"
+
 log "Installing XWayland desktop launcher override"
 DESKTOP_DIR="${TARGET_HOME}/.local/share/applications"
 as_user mkdir -p "${DESKTOP_DIR}"
 DESKTOP_PATH="${DESKTOP_DIR}/${DESKTOP_ID}"
 
-as_user tee "${DESKTOP_PATH}" >/dev/null <<'EOF'
+as_user tee "${DESKTOP_PATH}" >/dev/null <<EOF
 [Desktop Entry]
 Version=1.0
 Encoding=UTF-8
@@ -213,7 +356,8 @@ Type=Application
 Categories=Network;
 Name=TeamViewer
 Comment=Remote control solution (XWayland).
-Exec=env QT_QPA_PLATFORM=xcb /opt/teamviewer/tv_bin/script/teamviewer
+Exec=${BIN_DIR}/teamviewer
+DBusActivatable=false
 StartupWMClass=TeamViewer
 Icon=TeamViewer
 EOF
@@ -224,18 +368,29 @@ if command -v update-desktop-database >/dev/null 2>&1; then
   as_user update-desktop-database "${DESKTOP_DIR}" >/dev/null 2>&1 || true
 fi
 
-# Terminal launches: ~/.local/bin is on PATH ahead of /usr/bin on Omarchy.
-log "Installing ~/.local/bin/teamviewer wrapper (forces xcb)"
-BIN_DIR="${TARGET_HOME}/.local/bin"
-as_user mkdir -p "${BIN_DIR}"
-as_user tee "${BIN_DIR}/teamviewer" >/dev/null <<'EOF'
-#!/usr/bin/env bash
-# Force Qt5 TeamViewer onto XWayland. The bundled Qt has no wayland plugin.
-export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb}"
-exec /opt/teamviewer/tv_bin/script/teamviewer "$@"
+# gtk-launch / uwsm D-Bus-activate com.teamviewer.TeamViewer and ignore Exec=
+# unless the session service is overridden.
+log "Installing user D-Bus service override (forces xcb wrapper)"
+DBUS_DIR="${TARGET_HOME}/.local/share/dbus-1/services"
+as_user mkdir -p "${DBUS_DIR}"
+DBUS_PATH="${DBUS_DIR}/com.teamviewer.TeamViewer.service"
+as_user tee "${DBUS_PATH}" >/dev/null <<EOF
+[D-BUS Service]
+Name=com.teamviewer.TeamViewer
+Exec=${BIN_DIR}/teamviewer
 EOF
-as_user chmod 755 "${BIN_DIR}/teamviewer"
-ok "wrote ${BIN_DIR}/teamviewer"
+as_user chmod 644 "${DBUS_PATH}"
+ok "wrote ${DBUS_PATH}"
+
+log "Installing user D-Bus Desktop helper override"
+DBUS_DESKTOP_PATH="${DBUS_DIR}/com.teamviewer.TeamViewer.Desktop.service"
+as_user tee "${DBUS_DESKTOP_PATH}" >/dev/null <<EOF
+[D-BUS Service]
+Name=com.teamviewer.TeamViewer.Desktop
+Exec=${TVFIX_WRAP}
+EOF
+as_user chmod 644 "${DBUS_DESKTOP_PATH}"
+ok "wrote ${DBUS_DESKTOP_PATH}"
 
 # ---------------------------------------------------------------------------
 HYPR_LUA="${TARGET_HOME}/.config/hypr/hyprland.lua"
@@ -284,6 +439,9 @@ printf '    daemon:        %s (%s)\n' \
   "$(systemctl is-enabled teamviewerd 2>/dev/null || echo unknown)"
 printf '    desktop file:  %s\n' "${DESKTOP_PATH}"
 printf '    cli wrapper:   %s\n' "${BIN_DIR}/teamviewer"
+printf '    dbus service:  %s\n' "${DBUS_PATH}"
+printf '    dbus desktop:  %s\n' "${DBUS_DESKTOP_PATH}"
+printf '    capture wrap:  %s -> %s\n' "${TV_DESKTOP_ELF}" "$(readlink -f "${TV_DESKTOP_ELF}" 2>/dev/null || echo missing)"
 
 if [[ "${DO_LAUNCH}" -eq 1 ]]; then
   log "Launching TeamViewer GUI"
@@ -296,4 +454,4 @@ else
 fi
 
 log "First-run: accept the EULA in the GUI. For unattended access, set a personal password under Extras → Options → Security."
-log "Incoming Wayland control uses the desktop portal — approve the share prompt if the remote sees a black screen."
+log "Incoming capture: keep a graphical session logged in; approve the portal share prompt if the remote sees a black frame."
